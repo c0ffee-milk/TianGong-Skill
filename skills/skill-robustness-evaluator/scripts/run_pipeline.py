@@ -103,10 +103,45 @@ def extract_json_block(text: str) -> Any:
 
 def resolve_temperature(model: str, requested: float) -> float:
     normalized = model.strip().lower()
-    # Some Moonshot Kimi models currently only accept temperature=1.
-    if normalized in {"kimi-k2.5", "kimi-k2.6"}:
+    # Moonshot Kimi models pin temperature depending on thinking mode.
+    if normalized == "kimi-k2.5":
+        return 0.6
+    if normalized == "kimi-k2.6":
         return 1.0
     return requested
+
+
+def resolve_extra_body(model: str) -> dict[str, Any]:
+    normalized = model.strip().lower()
+    # Kimi K2.5 defaults to thinking mode, which can emit reasoning_content
+    # instead of JSON content. Disable thinking for strict JSON answer calls.
+    if normalized == "kimi-k2.5":
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
+def extract_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, list):
+        text_bits = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_bits.append(item.get("text", ""))
+        content = "\n".join(text_bits).strip()
+    else:
+        content = str(content).strip()
+
+    if content:
+        return content
+
+    reasoning_content = str(message.get("reasoning_content", "")).strip()
+    if reasoning_content:
+        raise RuntimeError(
+            "Model returned empty content but non-empty reasoning_content. "
+            "For Kimi-style models, disable thinking mode when you require strict JSON output."
+        )
+
+    raise RuntimeError(f"Model returned no usable content: {json.dumps(message, ensure_ascii=False)}")
 
 
 def chat_completion(
@@ -125,7 +160,9 @@ def chat_completion(
         "messages": messages,
         "temperature": resolve_temperature(model, temperature),
         "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
     }
+    payload.update(resolve_extra_body(model))
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
         url,
@@ -147,17 +184,11 @@ def chat_completion(
 
     parsed = json.loads(raw)
     try:
-        choice = parsed["choices"][0]["message"]["content"]
+        message = parsed["choices"][0]["message"]
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Unexpected API response: {raw}") from exc
 
-    if isinstance(choice, list):
-        text_bits = []
-        for item in choice:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text_bits.append(item.get("text", ""))
-        return "\n".join(text_bits).strip()
-    return str(choice).strip()
+    return extract_message_text(message)
 
 
 def call_json(
